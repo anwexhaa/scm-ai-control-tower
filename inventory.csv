@@ -1,0 +1,21 @@
+product_id,product_name,quantity_in_stock,reorder_threshold,supplier_info
+P001,Widget A,120,50,Supplier X
+P002,Gadget B,30,80,Supplier Y
+P003,Component C,500,100,Supplier Z
+P004,Industrial Bolt M8,900,300,Supplier Alpha
+P005,Industrial Nut M8,850,300,Supplier Alpha
+P006,Hydraulic Valve V2,45,60,Supplier Beta
+P007,Pressure Sensor PS-10,150,70,Supplier Gamma
+P008,Temperature Sensor TS-5,20,40,Supplier Gamma
+P009,Control Relay CR-220,65,50,Supplier Delta
+P010,Power Supply Unit 24V,40,60,Supplier Delta
+P011,Conveyor Belt Motor,12,20,Supplier Omega
+P012,Servo Motor SM-300,18,25,Supplier Omega
+P013,PCB Board Rev-A,320,150,Supplier Sigma
+P014,PCB Board Rev-B,90,120,Supplier Sigma
+P015,Lithium Battery Pack 12V,55,75,Supplier Nova
+P016,Lithium Battery Pack 24V,22,40,Supplier Nova
+P017,Packaging Box Small,1000,400,Supplier PackCo
+P018,Packaging Box Large,600,300,Supplier PackCo
+P019,RFID Scanner RS-1,28,35,Supplier TechSource
+P020,Barcode Scanner BS-2,14,30,Supplier TechSource
