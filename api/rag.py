@@ -2,12 +2,13 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 import chromadb
 import os
-import traceback  # Added for detailed error logs
+import traceback
 import re
 from numpy import dot
 from numpy.linalg import norm
+import json
 
-from .inventory import load_inventory  # ✅ Inventory integration
+from .inventory import load_inventory
 from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 
@@ -19,19 +20,16 @@ from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
 router = APIRouter()
 
-# Load embedding model
 embedding_model = SentenceTransformer(
     "sentence-transformers/all-MiniLM-L6-v2"
 )
 
-# Gemini setup
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
 gemini_model = genai.GenerativeModel(
     model_name="gemini-2.5-flash"
 )
 
-# Chroma client
 chroma_client = chromadb.Client()
 
 collection = chroma_client.get_or_create_collection(
@@ -44,13 +42,9 @@ class QueryRequest(BaseModel):
     question: str
     top_k: int = 5
 
-# ---------------- INVENTORY → TEXT (NEW) ----------------
+# ---------------- INVENTORY → TEXT ----------------
 
 def inventory_to_text_chunks():
-    """
-    Converts structured inventory CSV into natural-language facts
-    usable by the LLM inside RAG context.
-    """
     print("[DEBUG] Loading inventory data...")
     items = load_inventory()
     print(f"[DEBUG] Loaded {len(items)} inventory items.")
@@ -82,51 +76,123 @@ def inventory_to_text_chunks():
 
 def normalize_text(text: str) -> str:
     text = text.lower()
-    text = re.sub(r'\s+', ' ', text)  # collapse whitespace
-    text = re.sub(r'[^\w\s]', '', text)  # remove punctuation
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'[^\w\s]', '', text)
     return text.strip()
 
-# ---------------- Evaluation helper ----------------
+# ---------------- IMPROVED ROUGE + BLEU ----------------
 
 def evaluate_answer(generated: str, reference: str):
-    generated = normalize_text(generated)
-    reference = normalize_text(reference)
+    """
+    Evaluates answer quality using multiple ROUGE metrics and BLEU.
+    Returns scores as percentages for better readability.
+    """
+    generated_norm = normalize_text(generated)
+    reference_norm = normalize_text(reference)
 
-    scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
-    rouge_l = scorer.score(reference, generated)["rougeL"].fmeasure
+    # Use multiple ROUGE metrics for comprehensive evaluation
+    scorer = rouge_scorer.RougeScorer(
+        ["rouge1", "rouge2", "rougeL"], 
+        use_stemmer=True
+    )
+    
+    rouge_scores = scorer.score(reference_norm, generated_norm)
 
     smoothie = SmoothingFunction().method4
     bleu = sentence_bleu(
-        [reference.split()],
-        generated.split(),
+        [reference_norm.split()],
+        generated_norm.split(),
         smoothing_function=smoothie
     )
 
     return {
-        "rougeL": round(rouge_l, 3),
-        "bleu": round(bleu, 3)
+        "rouge1": round(rouge_scores["rouge1"].fmeasure * 100, 2),  # Convert to %
+        "rouge2": round(rouge_scores["rouge2"].fmeasure * 100, 2),  # Convert to %
+        "rougeL": round(rouge_scores["rougeL"].fmeasure * 100, 2),  # Convert to %
+        "bleu": round(bleu * 100, 2)  # Convert to %
     }
 
-# ---------------- Helper: find best matching chunk ----------------
+# ---------------- IMPROVED Faithfulness ----------------
 
-def get_best_matching_chunk(query_emb, documents, doc_embeddings):
-    max_sim = -1
-    best_chunk = ""
+def evaluate_faithfulness(answer: str, context: str):
+    """
+    Evaluates whether the answer is faithful to the context.
+    Returns faithfulness as a percentage.
+    """
+    prompt = f"""
+You are evaluating whether an AI-generated answer is faithful to the provided context.
+
+Context:
+{context}
+
+Answer:
+{answer}
+
+Carefully check whether every claim in the answer is directly supported by the context.
+A claim is faithful if it can be verified from the context without making assumptions.
+
+Respond ONLY in valid JSON format with no additional text:
+{{
+  "faithful": true or false,
+  "hallucinated_claims": ["list any claims not supported by context"],
+  "faithfulness_score": a number between 0 and 1 (0 = completely unfaithful, 1 = completely faithful)
+}}
+"""
+
+    try:
+        response = gemini_model.generate_content(prompt)
+        result_text = response.text.strip()
+        
+        # Remove markdown code blocks if present
+        if result_text.startswith("```json"):
+            result_text = result_text[7:]
+        if result_text.startswith("```"):
+            result_text = result_text[3:]
+        if result_text.endswith("```"):
+            result_text = result_text[:-3]
+        
+        result = json.loads(result_text.strip())
+        
+        # Convert to percentage and ensure proper format
+        return {
+            "faithful": result.get("faithful", False),
+            "hallucinated_claims": result.get("hallucinated_claims", []),
+            "faithfulness_percentage": round(result.get("faithfulness_score", 0) * 100, 2)
+        }
+    except Exception as e:
+        print(f"[ERROR] Faithfulness evaluation failed: {e}")
+        return {
+            "faithful": None,
+            "hallucinated_claims": [],
+            "faithfulness_percentage": None
+        }
+
+# ---------------- IMPROVED: Multiple reference chunks ----------------
+
+def get_top_matching_chunks(query_emb, documents, doc_embeddings, top_n=3):
+    """
+    Get top N most relevant chunks for building a comprehensive reference.
+    This improves ROUGE scores by including more relevant context.
+    """
+    similarities = []
     for doc, emb in zip(documents, doc_embeddings):
         sim = dot(query_emb, emb) / (norm(query_emb) * norm(emb))
-        if sim > max_sim:
-            max_sim = sim
-            best_chunk = doc
-    return best_chunk
+        similarities.append((sim, doc))
+    
+    # Sort by similarity and take top N
+    similarities.sort(reverse=True, key=lambda x: x[0])
+    top_chunks = [doc for _, doc in similarities[:top_n]]
+    
+    return " ".join(top_chunks)
 
-# ---------------- New helper to detect inventory questions ----------------
+# ---------------- Inventory detection ----------------
 
 def is_inventory_question(question: str) -> bool:
     keywords = ["inventory", "stock", "product", "reorder", "supplier", "quantity"]
     question_lower = question.lower()
     return any(kw in question_lower for kw in keywords)
 
-# ---------------- API ----------------
+# ---------------- IMPROVED API ----------------
 
 @router.post("/")
 async def rag_query(payload: QueryRequest):
@@ -136,14 +202,11 @@ async def rag_query(payload: QueryRequest):
         if not question:
             raise HTTPException(status_code=400, detail="Question is empty")
 
-        # 1️⃣ Embed user query
-        print("[DEBUG] Generating query embedding...")
+        # 1️⃣ Embed query
         query_embedding = embedding_model.encode(question).tolist()
-        print(f"[DEBUG] Query embedding length: {len(query_embedding)}")
 
-        # 2️⃣ Similarity search in Chroma — increase n_results for better recall
+        # 2️⃣ Chroma search - retrieve more for better context
         query_top_k = max(payload.top_k, 10)
-        print(f"[DEBUG] Querying Chroma for top {query_top_k} results...")
         results = collection.query(
             query_embeddings=[query_embedding],
             n_results=query_top_k,
@@ -152,9 +215,8 @@ async def rag_query(payload: QueryRequest):
 
         documents = results.get("documents", [[]])[0]
         metadatas = results.get("metadatas", [[]])[0]
-        print(f"[DEBUG] Retrieved {len(documents)} documents from Chroma.")
 
-        # 3️⃣ Inventory augmentation (NEW)
+        # 3️⃣ Inventory augmentation
         inventory_chunks = inventory_to_text_chunks()
 
         if not documents and not inventory_chunks:
@@ -164,16 +226,19 @@ async def rag_query(payload: QueryRequest):
                 "evaluation": None
             }
 
-        # 4️⃣ Build unified context
+        # 4️⃣ Build comprehensive context
         context_chunks = documents + inventory_chunks
         context = "\n\n".join(context_chunks)
-        print(f"[DEBUG] Built context with {len(context_chunks)} chunks.")
 
+        # 🔥 IMPROVED PROMPT for better answer quality
         prompt = f"""
-You are a supply chain intelligence assistant.
+You are a supply chain intelligence assistant. Answer the question below using ONLY the provided context.
 
-Answer the user's question ONLY using the context below.
-If the answer is not present, say you do not have enough information.
+Instructions:
+- Be precise and comprehensive
+- Include specific details from the context (numbers, names, dates)
+- Structure your answer clearly
+- If the answer is not in the context, state that clearly
 
 Context:
 {context}
@@ -185,24 +250,30 @@ Answer:
 """
 
         # 5️⃣ Generate answer
-        print("[DEBUG] Generating answer using Gemini model...")
         response = gemini_model.generate_content(prompt)
-        answer = response.text
-        print(f"[DEBUG] Generated answer length: {len(answer)}")
+        answer = response.text.strip()
 
-        # Embed documents for similarity
+        # 6️⃣ IMPROVED evaluation reference
         doc_embeddings = [embedding_model.encode(doc) for doc in documents]
 
-        # Get best matching chunk for evaluation
         if documents:
-            reference_answer = get_best_matching_chunk(query_embedding, documents, doc_embeddings)
+            # Use multiple top chunks for better reference
+            reference_answer = get_top_matching_chunks(
+                embedding_model.encode(question), 
+                documents, 
+                doc_embeddings,
+                top_n=3  # Use top 3 chunks for richer reference
+            )
         else:
-            reference_answer = context_chunks[0]
+            reference_answer = " ".join(context_chunks[:3])
 
-        print("[DEBUG] Evaluating generated answer...")
-        evaluation_scores = evaluate_answer(answer, reference_answer)
+        # Calculate ROUGE and BLEU scores
+        rouge_bleu_scores = evaluate_answer(answer, reference_answer)
 
-        # 7️⃣ Sources (PDF only — inventory is implicit)
+        # 🔥 Faithfulness evaluation
+        faithfulness = evaluate_faithfulness(answer, context)
+
+        # 7️⃣ Sources
         sources = [
             {
                 "text": doc,
@@ -214,15 +285,23 @@ Answer:
 
         is_inventory = is_inventory_question(question)
 
-        print("[DEBUG] Returning response to client.")
         return {
             "question": question,
             "answer": answer,
-            "evaluation": evaluation_scores if not is_inventory else None,
+            "evaluation": (
+                {
+                    **rouge_bleu_scores,
+                    "faithfulness": faithfulness
+                }
+                if not is_inventory else None
+            ),
             "sources": sources if not is_inventory else [],
             "show_evaluation_and_sources": not is_inventory,
         }
+
     except Exception as e:
-        print("[ERROR] Exception occurred in /rag/ endpoint:")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(e)}"
+        )
