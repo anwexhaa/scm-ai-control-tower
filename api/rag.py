@@ -7,12 +7,12 @@ import re
 from numpy import dot
 from numpy.linalg import norm
 import json
+from datetime import datetime
 
 from .inventory import load_inventory
 from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 
-# 🔹 Evaluation imports
 from rouge_score import rouge_scorer
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
@@ -41,6 +41,45 @@ collection = chroma_client.get_or_create_collection(
 class QueryRequest(BaseModel):
     question: str
     top_k: int = 5
+    use_only_last_document: bool = False  # 🔥 NEW FLAG
+
+# ---------------- HELPER: Get Last Document ----------------
+
+def get_last_uploaded_document():
+    """
+    Retrieves metadata about the most recently uploaded document.
+    Returns the document source/filename.
+    """
+    try:
+        # Get all documents from collection
+        all_docs = collection.get(include=["metadatas"])
+        
+        if not all_docs or not all_docs.get("metadatas"):
+            return None
+        
+        metadatas = all_docs["metadatas"]
+        
+        # Find the most recent document by timestamp or filename
+        latest_doc = None
+        latest_timestamp = None
+        
+        for meta in metadatas:
+            timestamp = meta.get("upload_timestamp")
+            if timestamp:
+                if latest_timestamp is None or timestamp > latest_timestamp:
+                    latest_timestamp = timestamp
+                    latest_doc = meta.get("source")
+        
+        # If no timestamp, fall back to last entry
+        if not latest_doc and metadatas:
+            latest_doc = metadatas[-1].get("source")
+        
+        print(f"[DEBUG] Last uploaded document: {latest_doc}")
+        return latest_doc
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to get last document: {e}")
+        return None
 
 # ---------------- INVENTORY → TEXT ----------------
 
@@ -80,17 +119,12 @@ def normalize_text(text: str) -> str:
     text = re.sub(r'[^\w\s]', '', text)
     return text.strip()
 
-# ---------------- IMPROVED ROUGE + BLEU ----------------
+# ---------------- ROUGE + BLEU ----------------
 
 def evaluate_answer(generated: str, reference: str):
-    """
-    Evaluates answer quality using multiple ROUGE metrics and BLEU.
-    Returns scores as percentages for better readability.
-    """
     generated_norm = normalize_text(generated)
     reference_norm = normalize_text(reference)
 
-    # Use multiple ROUGE metrics for comprehensive evaluation
     scorer = rouge_scorer.RougeScorer(
         ["rouge1", "rouge2", "rougeL"], 
         use_stemmer=True
@@ -106,19 +140,15 @@ def evaluate_answer(generated: str, reference: str):
     )
 
     return {
-        "rouge1": round(rouge_scores["rouge1"].fmeasure * 100, 2),  # Convert to %
-        "rouge2": round(rouge_scores["rouge2"].fmeasure * 100, 2),  # Convert to %
-        "rougeL": round(rouge_scores["rougeL"].fmeasure * 100, 2),  # Convert to %
-        "bleu": round(bleu * 100, 2)  # Convert to %
+        "rouge1": round(rouge_scores["rouge1"].fmeasure * 100, 2),
+        "rouge2": round(rouge_scores["rouge2"].fmeasure * 100, 2),
+        "rougeL": round(rouge_scores["rougeL"].fmeasure * 100, 2),
+        "bleu": round(bleu * 100, 2)
     }
 
-# ---------------- IMPROVED Faithfulness ----------------
+# ---------------- Faithfulness ----------------
 
 def evaluate_faithfulness(answer: str, context: str):
-    """
-    Evaluates whether the answer is faithful to the context.
-    Returns faithfulness as a percentage.
-    """
     prompt = f"""
 You are evaluating whether an AI-generated answer is faithful to the provided context.
 
@@ -143,7 +173,6 @@ Respond ONLY in valid JSON format with no additional text:
         response = gemini_model.generate_content(prompt)
         result_text = response.text.strip()
         
-        # Remove markdown code blocks if present
         if result_text.startswith("```json"):
             result_text = result_text[7:]
         if result_text.startswith("```"):
@@ -153,7 +182,6 @@ Respond ONLY in valid JSON format with no additional text:
         
         result = json.loads(result_text.strip())
         
-        # Convert to percentage and ensure proper format
         return {
             "faithful": result.get("faithful", False),
             "hallucinated_claims": result.get("hallucinated_claims", []),
@@ -167,19 +195,14 @@ Respond ONLY in valid JSON format with no additional text:
             "faithfulness_percentage": None
         }
 
-# ---------------- IMPROVED: Multiple reference chunks ----------------
+# ---------------- Helper: Multiple reference chunks ----------------
 
 def get_top_matching_chunks(query_emb, documents, doc_embeddings, top_n=3):
-    """
-    Get top N most relevant chunks for building a comprehensive reference.
-    This improves ROUGE scores by including more relevant context.
-    """
     similarities = []
     for doc, emb in zip(documents, doc_embeddings):
         sim = dot(query_emb, emb) / (norm(query_emb) * norm(emb))
         similarities.append((sim, doc))
     
-    # Sort by similarity and take top N
     similarities.sort(reverse=True, key=lambda x: x[0])
     top_chunks = [doc for _, doc in similarities[:top_n]]
     
@@ -192,7 +215,7 @@ def is_inventory_question(question: str) -> bool:
     question_lower = question.lower()
     return any(kw in question_lower for kw in keywords)
 
-# ---------------- IMPROVED API ----------------
+# ---------------- API ----------------
 
 @router.post("/")
 async def rag_query(payload: QueryRequest):
@@ -205,32 +228,46 @@ async def rag_query(payload: QueryRequest):
         # 1️⃣ Embed query
         query_embedding = embedding_model.encode(question).tolist()
 
-        # 2️⃣ Chroma search - retrieve more for better context
+        # 2️⃣ Chroma search with optional filtering
         query_top_k = max(payload.top_k, 10)
+        
+        # 🔥 NEW: Filter by last document if requested
+        where_filter = None
+        if payload.use_only_last_document:
+            last_doc = get_last_uploaded_document()
+            if last_doc:
+                where_filter = {"source": last_doc}
+                print(f"[DEBUG] Filtering results to only: {last_doc}")
+            else:
+                print("[WARNING] No last document found, using all documents")
+        
         results = collection.query(
             query_embeddings=[query_embedding],
             n_results=query_top_k,
+            where=where_filter,  # 🔥 Apply filter
             include=["documents", "metadatas"]
         )
 
         documents = results.get("documents", [[]])[0]
         metadatas = results.get("metadatas", [[]])[0]
 
-        # 3️⃣ Inventory augmentation
-        inventory_chunks = inventory_to_text_chunks()
+        # 3️⃣ Inventory augmentation (skip if using only last doc)
+        inventory_chunks = []
+        if not payload.use_only_last_document:
+            inventory_chunks = inventory_to_text_chunks()
 
         if not documents and not inventory_chunks:
             return {
-                "answer": "No relevant information found in the knowledge base.",
+                "answer": "No relevant information found in the specified document.",
                 "sources": [],
-                "evaluation": None
+                "evaluation": None,
+                "filtered_to_last_document": payload.use_only_last_document
             }
 
-        # 4️⃣ Build comprehensive context
+        # 4️⃣ Build context
         context_chunks = documents + inventory_chunks
         context = "\n\n".join(context_chunks)
 
-        # 🔥 IMPROVED PROMPT for better answer quality
         prompt = f"""
 You are a supply chain intelligence assistant. Answer the question below using ONLY the provided context.
 
@@ -253,24 +290,20 @@ Answer:
         response = gemini_model.generate_content(prompt)
         answer = response.text.strip()
 
-        # 6️⃣ IMPROVED evaluation reference
+        # 6️⃣ Evaluation
         doc_embeddings = [embedding_model.encode(doc) for doc in documents]
 
         if documents:
-            # Use multiple top chunks for better reference
             reference_answer = get_top_matching_chunks(
                 embedding_model.encode(question), 
                 documents, 
                 doc_embeddings,
-                top_n=3  # Use top 3 chunks for richer reference
+                top_n=3
             )
         else:
             reference_answer = " ".join(context_chunks[:3])
 
-        # Calculate ROUGE and BLEU scores
         rouge_bleu_scores = evaluate_answer(answer, reference_answer)
-
-        # 🔥 Faithfulness evaluation
         faithfulness = evaluate_faithfulness(answer, context)
 
         # 7️⃣ Sources
@@ -297,6 +330,8 @@ Answer:
             ),
             "sources": sources if not is_inventory else [],
             "show_evaluation_and_sources": not is_inventory,
+            "filtered_to_last_document": payload.use_only_last_document,  # 🔥 NEW
+            "document_used": get_last_uploaded_document() if payload.use_only_last_document else "all"  # 🔥 NEW
         }
 
     except Exception as e:
