@@ -1,0 +1,6 @@
+supplier_name,base_cost_per_unit,on_time_delivery_rate,lead_time_days,quality_rating,historical_issues,contact_info
+Supplier X,28.50,0.98,3,4.8,0,contact@supplierx.com
+Supplier Y,22.00,0.85,7,3.5,1,sales@suppliery.com
+Supplier Z,18.00,0.65,14,2.5,4,support@supplierz.com
+Supplier Alpha,35.00,0.95,1,4.5,0,urgent@supplieralpha.com
+Global Tech,24.00,0.90,5,4.0,2,global@tech.com

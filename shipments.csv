@@ -1,0 +1,6 @@
+shipment_id,product_id,quantity,supplier,carrier,status,is_on_time,expected_delivery,actual_delivery
+SHP-001,P001,100,Supplier X,FastLogistics,Delivered,1,2026-02-01,2026-02-01
+SHP-002,P003,500,Supplier Z,GlobalCargo,Delivered,1,2026-02-05,2026-02-04
+SHP-003,P007,150,Supplier Gamma,FastLogistics,In Transit,1,2026-02-15,
+SHP-004,P011,20,Supplier Omega,ExpressWay,Delayed,0,2026-02-10,2026-02-12
+SHP-005,P013,300,Supplier Sigma,FastLogistics,Delivered,1,2026-02-08,2026-02-08

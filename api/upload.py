@@ -17,7 +17,7 @@ embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 # Minimal addition: in-memory store for uploaded files metadata
 uploaded_files_metadata = []
 
-@router.post("/")
+@router.post("/pdf")
 async def upload_pdf(files: List[UploadFile] = File(...)):
     total_chunks_added = 0
     print(f"[DEBUG] Number of files received: {len(files)}")

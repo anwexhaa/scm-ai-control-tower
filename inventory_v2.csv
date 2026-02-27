@@ -1,5 +1,5 @@
 product_id,product_name,quantity_in_stock,reorder_threshold,warehouse,supplier_info
-P001,Widget A,120,50,Main Warehouse,Supplier X
+P001,Widget A,999,50,Main Warehouse,Supplier X
 P002,Gadget B,30,80,Main Warehouse,Supplier Y
 P003,Component C,500,100,Main Warehouse,Supplier Z
 P004,Industrial Bolt M8,900,300,Main Warehouse,Supplier Alpha
@@ -7,7 +7,7 @@ P005,Industrial Nut M8,850,300,Main Warehouse,Supplier Alpha
 P006,Hydraulic Valve V2,45,60,Main Warehouse,Supplier Beta
 P007,Pressure Sensor PS-10,150,70,Main Warehouse,Supplier Gamma
 P008,Temperature Sensor TS-5,20,40,Main Warehouse,Supplier Gamma
-P009,Control Relay CR-220,65,50,Main Warehouse,Supplier Delta
+P009,Control Relay CR-220,6590,50,Main Warehouse,Supplier Delta
 P010,Power Supply Unit 24V,40,60,Main Warehouse,Supplier Delta
 P011,Conveyor Belt Motor,12,20,Main Warehouse,Supplier Omega
 P012,Servo Motor SM-300,18,25,Main Warehouse,Supplier Omega

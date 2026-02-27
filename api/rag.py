@@ -8,8 +8,10 @@ from numpy import dot
 from numpy.linalg import norm
 import json
 from datetime import datetime
+from sqlalchemy import select
 
-from .inventory import load_inventory
+from database import AsyncSessionLocal
+from models import Inventory
 from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 
@@ -30,10 +32,11 @@ gemini_model = genai.GenerativeModel(
     model_name="gemini-2.5-flash"
 )
 
-chroma_client = chromadb.Client()
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
 
 collection = chroma_client.get_or_create_collection(
-    name="pdf_chunks"
+    name="pdf_chunks",
+    metadata={"hnsw:space": "cosine"}
 )
 
 # ---------------- SCHEMA ----------------
@@ -41,7 +44,7 @@ collection = chroma_client.get_or_create_collection(
 class QueryRequest(BaseModel):
     question: str
     top_k: int = 5
-    use_only_last_document: bool = False  # 🔥 NEW FLAG
+    use_only_last_document: bool = False
 
 # ---------------- HELPER: Get Last Document ----------------
 
@@ -51,7 +54,6 @@ def get_last_uploaded_document():
     Returns the document source/filename.
     """
     try:
-        # Get all documents from collection
         all_docs = collection.get(include=["metadatas"])
         
         if not all_docs or not all_docs.get("metadatas"):
@@ -59,7 +61,6 @@ def get_last_uploaded_document():
         
         metadatas = all_docs["metadatas"]
         
-        # Find the most recent document by timestamp or filename
         latest_doc = None
         latest_timestamp = None
         
@@ -70,7 +71,6 @@ def get_last_uploaded_document():
                     latest_timestamp = timestamp
                     latest_doc = meta.get("source")
         
-        # If no timestamp, fall back to last entry
         if not latest_doc and metadatas:
             latest_doc = metadatas[-1].get("source")
         
@@ -81,30 +81,39 @@ def get_last_uploaded_document():
         print(f"[ERROR] Failed to get last document: {e}")
         return None
 
-# ---------------- INVENTORY → TEXT ----------------
+# ---------------- INVENTORY → TEXT (now reads from DB) ----------------
 
-def inventory_to_text_chunks():
-    print("[DEBUG] Loading inventory data...")
-    items = load_inventory()
-    print(f"[DEBUG] Loaded {len(items)} inventory items.")
+async def inventory_to_text_chunks():
+    """
+    Reads active inventory from PostgreSQL and converts to
+    text chunks for RAG context. Replaces old CSV-based load_inventory().
+    """
+    print("[DEBUG] Loading inventory data from DB...")
     chunks = []
 
-    for item in items:
-        status = (
-            "Low Stock"
-            if item.quantity_in_stock < item.reorder_threshold
-            else "Normal"
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Inventory).where(Inventory.is_active == True)
         )
+        items = result.scalars().all()
+        print(f"[DEBUG] Loaded {len(items)} inventory items from DB.")
 
-        text = (
-            f"Product {item.product_id} ({item.product_name}) "
-            f"has {item.quantity_in_stock} units in stock. "
-            f"Reorder threshold is {item.reorder_threshold}. "
-            f"Inventory status is {status}."
-        )
+        for item in items:
+            status = (
+                "Low Stock"
+                if item.quantity_in_stock < item.reorder_threshold
+                else "Normal"
+            )
 
-        if item.supplier_info:
-            text += f" Supplier information: {item.supplier_info}."
+            text = (
+                f"Product {item.product_id} ({item.product_name}) "
+                f"has {item.quantity_in_stock} units in stock. "
+                f"Reorder threshold is {item.reorder_threshold}. "
+                f"Inventory status is {status}."
+            )
+
+            if item.supplier_info:
+                text += f" Supplier information: {item.supplier_info}."
 
         chunks.append(text)
 
@@ -225,13 +234,12 @@ async def rag_query(payload: QueryRequest):
         if not question:
             raise HTTPException(status_code=400, detail="Question is empty")
 
-        # 1️⃣ Embed query
+        # 1. Embed query
         query_embedding = embedding_model.encode(question).tolist()
 
-        # 2️⃣ Chroma search with optional filtering
+        # 2. Chroma search with optional filtering
         query_top_k = max(payload.top_k, 10)
         
-        # 🔥 NEW: Filter by last document if requested
         where_filter = None
         if payload.use_only_last_document:
             last_doc = get_last_uploaded_document()
@@ -244,17 +252,17 @@ async def rag_query(payload: QueryRequest):
         results = collection.query(
             query_embeddings=[query_embedding],
             n_results=query_top_k,
-            where=where_filter,  # 🔥 Apply filter
+            where=where_filter,
             include=["documents", "metadatas"]
         )
 
         documents = results.get("documents", [[]])[0]
         metadatas = results.get("metadatas", [[]])[0]
 
-        # 3️⃣ Inventory augmentation (skip if using only last doc)
+        # 3. Inventory augmentation from DB (skip if using only last doc)
         inventory_chunks = []
         if not payload.use_only_last_document:
-            inventory_chunks = inventory_to_text_chunks()
+            inventory_chunks = await inventory_to_text_chunks()  # now async + DB
 
         if not documents and not inventory_chunks:
             return {
@@ -264,7 +272,7 @@ async def rag_query(payload: QueryRequest):
                 "filtered_to_last_document": payload.use_only_last_document
             }
 
-        # 4️⃣ Build context
+        # 4. Build context
         context_chunks = documents + inventory_chunks
         context = "\n\n".join(context_chunks)
 
@@ -286,11 +294,11 @@ Question:
 Answer:
 """
 
-        # 5️⃣ Generate answer
+        # 5. Generate answer
         response = gemini_model.generate_content(prompt)
         answer = response.text.strip()
 
-        # 6️⃣ Evaluation
+        # 6. Evaluation
         doc_embeddings = [embedding_model.encode(doc) for doc in documents]
 
         if documents:
@@ -306,7 +314,7 @@ Answer:
         rouge_bleu_scores = evaluate_answer(answer, reference_answer)
         faithfulness = evaluate_faithfulness(answer, context)
 
-        # 7️⃣ Sources
+        # 7. Sources
         sources = [
             {
                 "text": doc,
@@ -330,8 +338,8 @@ Answer:
             ),
             "sources": sources if not is_inventory else [],
             "show_evaluation_and_sources": not is_inventory,
-            "filtered_to_last_document": payload.use_only_last_document,  # 🔥 NEW
-            "document_used": get_last_uploaded_document() if payload.use_only_last_document else "all"  # 🔥 NEW
+            "filtered_to_last_document": payload.use_only_last_document,
+            "document_used": get_last_uploaded_document() if payload.use_only_last_document else "all"
         }
 
     except Exception as e:

@@ -1,0 +1,6 @@
+sku,item_description,units_on_hand,min_qty,location,vendor
+P021,Copper Wire 2mm,450,100,East Wing,FastSupply Co
+P022,Steel Rod 10mm,80,200,West Wing,MetalWorks Ltd
+P023,Rubber Gasket A4,1200,400,Main Store,SealTech
+P024,Bolt M6 Stainless,3000,800,Main Store,FastSupply Co
+P025,Bearing 6205,60,150,East Wing,PrecisionParts
