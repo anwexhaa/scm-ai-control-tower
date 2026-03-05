@@ -5,17 +5,23 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 import chromadb
 import tempfile
 import os
+import uuid
 from typing import List
 
 from sentence_transformers import SentenceTransformer
 
 router = APIRouter()
 
-# Load sentence transformer ONCE (important for performance)
 embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
-# Minimal addition: in-memory store for uploaded files metadata
 uploaded_files_metadata = []
+
+# ── Use PersistentClient so chunks survive server restarts ──
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
+collection = chroma_client.get_or_create_collection(
+    name="pdf_chunks",
+    metadata={"hnsw:space": "cosine"}
+)
 
 @router.post("/pdf")
 async def upload_pdf(files: List[UploadFile] = File(...)):
@@ -62,7 +68,6 @@ async def upload_pdf(files: List[UploadFile] = File(...)):
             chunks = splitter.split_text(text)
             all_chunks.extend(chunks)
             print(f"[DEBUG] Page {page_num + 1} in {filename}: {len(chunks)} chunks")
-            # Add metadata for each chunk
             for _ in chunks:
                 all_metadatas.append({
                     "source": filename,
@@ -73,7 +78,7 @@ async def upload_pdf(files: List[UploadFile] = File(...)):
             print(f"[ERROR] No text found in PDF {filename}")
             raise HTTPException(status_code=400, detail=f"No text found in PDF {filename}")
 
-        # 4. Generate embeddings locally
+        # 3. Generate embeddings
         try:
             embeddings = embedding_model.encode(all_chunks, show_progress_bar=False).tolist()
             print(f"[DEBUG] Generated embeddings for {len(all_chunks)} chunks")
@@ -81,20 +86,13 @@ async def upload_pdf(files: List[UploadFile] = File(...)):
             print(f"[ERROR] Embedding error for {filename}: {e}")
             raise HTTPException(status_code=500, detail=f"Embedding error: {e}")
 
-        # 5. Initialize Chroma
+        # 4. Store in persistent ChromaDB with unique IDs
+        # ── FIX: unique IDs per chunk so uploads never overwrite each other ──
         try:
-            client = chromadb.Client()
-            collection = client.get_or_create_collection(
-                name="pdf_chunks", metadata={"hnsw:space": "cosine"}
-            )
-            print(f"[DEBUG] Chroma collection initialized or retrieved")
-        except Exception as e:
-            print(f"[ERROR] Vector DB init error: {e}")
-            raise HTTPException(status_code=500, detail=f"Vector DB init error: {e}")
-
-        # 6. Store embeddings with metadata
-        try:
-            ids = [f"chunk_{i}" for i in range(len(all_chunks))]
+            ids = [
+                f"chunk_{filename}_{i}_{uuid.uuid4().hex[:8]}"
+                for i in range(len(all_chunks))
+            ]
             collection.add(
                 documents=all_chunks,
                 embeddings=embeddings,
@@ -108,7 +106,6 @@ async def upload_pdf(files: List[UploadFile] = File(...)):
 
         total_chunks_added += len(all_chunks)
 
-        # Minimal addition: store file metadata for GET
         uploaded_files_metadata.append({
             "name": filename,
             "status": "Indexed",
@@ -121,7 +118,7 @@ async def upload_pdf(files: List[UploadFile] = File(...)):
         "chunks_added": total_chunks_added
     })
 
-# Minimal addition: GET handler to list uploaded files metadata
+
 @router.get("/")
 async def list_uploaded_files():
     return {"files": uploaded_files_metadata}

@@ -3,10 +3,23 @@ from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 import google.generativeai as genai
 from datetime import datetime
+from io import BytesIO
+
+# PDF generation
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.lib import colors
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table,
+    TableStyle, HRFlowable
+)
 
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 model = genai.GenerativeModel("gemini-2.5-flash")
 
+
+# ── Pydantic Models ──────────────────────────────────────────
 
 class ReportKPIs(BaseModel):
     inventory_health: float
@@ -26,14 +39,13 @@ class ExecutiveReport(BaseModel):
     forward_projections: List[str]
 
 
+# ── Report Agent ─────────────────────────────────────────────
+
 class ReportAgent:
     def __init__(self):
         self.target_health = 90.0
 
-    # ── KPI 1: Inventory Health ──────────────────────────────
-
     def calculate_inventory_health(self, items: List[dict]) -> float:
-        """(1 - low_stock_items / total) × 100"""
         if not items:
             return 0.0
         low_stock = sum(
@@ -42,10 +54,7 @@ class ReportAgent:
         )
         return round((1 - (low_stock / len(items))) * 100, 2)
 
-    # ── KPI 2: Shipment On-Time Rate ─────────────────────────
-
     def calculate_shipment_on_time(self, shipments: List[dict]) -> float:
-        """on_time / total × 100"""
         if not shipments:
             return 0.0
         on_time = sum(
@@ -54,55 +63,36 @@ class ReportAgent:
         )
         return round((on_time / len(shipments)) * 100, 2)
 
-    # ── KPI 3: Supplier Health ───────────────────────────────
-
     def calculate_supplier_health(self, suppliers: List[dict]) -> float:
-        """
-        Weighted average: on_time_rate (50%) + quality/5 (30%) + (1 - issues×0.1) (20%)
-        """
         if not suppliers:
             return 0.0
         scores = []
         for s in suppliers:
-            on_time  = float(s.get("on_time_delivery_rate", 0.8))
-            quality  = float(s.get("quality_rating", 3.0)) / 5
-            issues   = int(s.get("historical_issues", 0))
+            on_time       = float(s.get("on_time_delivery_rate", 0.8))
+            quality       = float(s.get("quality_rating", 3.0)) / 5
+            issues        = int(s.get("historical_issues", 0))
             issue_penalty = max(0, 1 - (issues * 0.1))
             score = (on_time * 0.5) + (quality * 0.3) + (issue_penalty * 0.2)
             scores.append(score)
         return round((sum(scores) / len(scores)) * 100, 2)
 
-    # ── KPI 4: Forward Projections ───────────────────────────
-
     def calculate_forward_projections(self, items: List[dict]) -> tuple[int, List[str]]:
-        """
-        Projects which products will hit stockout in next 14 days.
-        Uses avg_daily_consumption from DB if available, estimates otherwise.
-        Returns (count, list of product warnings)
-        """
-        warnings    = []
+        warnings       = []
         stockout_count = 0
-
         for item in items:
             stock     = item.get("quantity_in_stock", 0)
             threshold = item.get("reorder_threshold", 0)
             avg_daily = item.get("avg_daily_consumption")
-
             if not avg_daily or avg_daily <= 0:
                 avg_daily = threshold / 14 if threshold > 0 else 1.0
-
             days_left = int(stock / avg_daily) if avg_daily > 0 else 999
-
             if days_left <= 14:
                 stockout_count += 1
                 warnings.append(
                     f"{item.get('product_name', 'Unknown')} "
                     f"(stock: {stock}, ~{days_left}d remaining)"
                 )
-
         return stockout_count, warnings
-
-    # ── Root Cause Detection ─────────────────────────────────
 
     def detect_root_causes(
         self,
@@ -110,22 +100,13 @@ class ReportAgent:
         shipments: List[dict],
         suppliers: List[dict]
     ) -> List[str]:
-        """
-        Identifies patterns that explain poor KPIs.
-        Examples:
-        - Multiple stockouts from same supplier
-        - Specific carrier causing delays
-        - Specific warehouse with inventory issues
-        """
         causes = []
 
-        # Pattern 1: Supplier linked to multiple low-stock items
         supplier_issues: Dict[str, int] = {}
         for item in items:
             if item.get("quantity_in_stock", 0) < item.get("reorder_threshold", 0):
                 supplier = item.get("supplier_info", "Unknown")
                 supplier_issues[supplier] = supplier_issues.get(supplier, 0) + 1
-
         for supplier, count in supplier_issues.items():
             if count >= 2:
                 causes.append(
@@ -133,15 +114,11 @@ class ReportAgent:
                     f"review supplier reliability or lead times."
                 )
 
-        # Pattern 2: Carrier with high delay rate
         carrier_delays: Dict[str, list] = {}
         for s in shipments:
-            carrier   = s.get("carrier", "Unknown")
+            carrier    = s.get("carrier", "Unknown")
             is_on_time = str(s.get("is_on_time", "1")).lower() in ["true", "1", "yes"]
-            if carrier not in carrier_delays:
-                carrier_delays[carrier] = []
-            carrier_delays[carrier].append(is_on_time)
-
+            carrier_delays.setdefault(carrier, []).append(is_on_time)
         for carrier, records in carrier_delays.items():
             if len(records) >= 3:
                 late_rate = 1 - (sum(records) / len(records))
@@ -151,13 +128,11 @@ class ReportAgent:
                         f"over {len(records)} shipments — consider switching carriers."
                     )
 
-        # Pattern 3: Warehouse concentration risk
         warehouse_issues: Dict[str, int] = {}
         for item in items:
             if item.get("quantity_in_stock", 0) < item.get("reorder_threshold", 0):
                 wh = item.get("warehouse", "Unknown")
                 warehouse_issues[wh] = warehouse_issues.get(wh, 0) + 1
-
         for wh, count in warehouse_issues.items():
             if count >= 3:
                 causes.append(
@@ -165,7 +140,6 @@ class ReportAgent:
                     f"check replenishment process for this location."
                 )
 
-        # Pattern 4: Suppliers with high historical issues
         for s in suppliers:
             issues = int(s.get("historical_issues", 0))
             if issues >= 2:
@@ -174,9 +148,7 @@ class ReportAgent:
                     f"{issues} recorded incidents — assess risk of continued use."
                 )
 
-        return causes if causes else ["No significant root causes detected in current data."]
-
-    # ── LLM Executive Summary ────────────────────────────────
+        return list(dict.fromkeys(causes)) if causes else ["No significant root causes detected in current data."]
 
     async def generate_summary(
         self,
@@ -186,7 +158,6 @@ class ReportAgent:
     ) -> str:
         causes_text      = "\n".join(f"- {c}" for c in root_causes)
         projections_text = "\n".join(f"- {p}" for p in projections) if projections else "None"
-
         prompt = f"""
 You are a senior supply chain analyst writing an executive summary for a weekly report.
 
@@ -210,8 +181,6 @@ Focus on what needs immediate attention and why. Do not use bullet points.
         response = await model.generate_content_async(prompt)
         return response.text.strip()
 
-    # ── Master Report Function ───────────────────────────────
-
     async def create_weekly_report(
         self,
         inventory_data: List[dict],
@@ -221,10 +190,30 @@ Focus on what needs immediate attention and why. Do not use bullet points.
 
         suppliers = supplier_data or []
 
-        # Calculate all KPIs
-        inv_health   = self.calculate_inventory_health(inventory_data)
-        ship_rate    = self.calculate_shipment_on_time(shipment_data)
-        supp_health  = self.calculate_supplier_health(suppliers)
+        # Auto-correct missing fields
+        for idx, item in enumerate(inventory_data):
+            if not item.get("product_id"):
+                item["product_id"] = f"AUTO-{idx+1}"
+            if not item.get("product_name"):
+                item["product_name"] = f"Unknown Product {idx+1}"
+            if item.get("quantity_in_stock") is None:
+                item["quantity_in_stock"] = 0
+            if item.get("reorder_threshold") is None:
+                item["reorder_threshold"] = 1
+        for s in suppliers:
+            if s.get("on_time_delivery_rate") is None:
+                s["on_time_delivery_rate"] = 0.8
+            if s.get("quality_rating") is None:
+                s["quality_rating"] = 3.0
+            if s.get("historical_issues") is None:
+                s["historical_issues"] = 0
+        for s in shipment_data:
+            if s.get("is_on_time") is None:
+                s["is_on_time"] = True
+
+        inv_health  = self.calculate_inventory_health(inventory_data)
+        ship_rate   = self.calculate_shipment_on_time(shipment_data)
+        supp_health = self.calculate_supplier_health(suppliers)
 
         critical_count = sum(
             1 for item in inventory_data
@@ -247,10 +236,8 @@ Focus on what needs immediate attention and why. Do not use bullet points.
         )
 
         root_causes = self.detect_root_causes(inventory_data, shipment_data, suppliers)
+        summary     = await self.generate_summary(kpis, root_causes, stockout_warnings)
 
-        summary = await self.generate_summary(kpis, root_causes, stockout_warnings)
-
-        # Dynamic recommendations based on actual data
         recommendations = []
         if inv_health < 90:
             recommendations.append(
@@ -274,9 +261,7 @@ Focus on what needs immediate attention and why. Do not use bullet points.
                 f"historical issues and low quality ratings."
             )
         if not recommendations:
-            recommendations.append(
-                "All KPIs within acceptable ranges. Continue monitoring."
-            )
+            recommendations.append("All KPIs within acceptable ranges. Continue monitoring.")
 
         return ExecutiveReport(
             timestamp=datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -286,3 +271,179 @@ Focus on what needs immediate attention and why. Do not use bullet points.
             root_causes=root_causes,
             forward_projections=stockout_warnings
         )
+
+
+# ── PDF Generator ─────────────────────────────────────────────
+# Called by GET /agent/report/pdf in agent.py
+# Returns raw bytes streamed directly to the browser as a download
+
+def generate_report_pdf(report: ExecutiveReport) -> bytes:
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=letter,
+        rightMargin=0.75 * inch,
+        leftMargin=0.75 * inch,
+        topMargin=0.75 * inch,
+        bottomMargin=0.75 * inch
+    )
+
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        "ReportTitle", parent=styles["Title"],
+        fontSize=22, textColor=colors.HexColor("#1a1a2e"), spaceAfter=4
+    )
+    subtitle_style = ParagraphStyle(
+        "Subtitle", parent=styles["Normal"],
+        fontSize=10, textColor=colors.HexColor("#666666"), spaceAfter=16
+    )
+    section_style = ParagraphStyle(
+        "SectionHeader", parent=styles["Heading2"],
+        fontSize=13, textColor=colors.HexColor("#1a1a2e"),
+        spaceBefore=16, spaceAfter=6
+    )
+    body_style = ParagraphStyle(
+        "Body", parent=styles["Normal"],
+        fontSize=10, leading=15, textColor=colors.HexColor("#333333")
+    )
+    bullet_style = ParagraphStyle(
+        "Bullet", parent=body_style,
+        leftIndent=16, spaceBefore=3
+    )
+    footer_style = ParagraphStyle(
+        "Footer", parent=styles["Normal"],
+        fontSize=8, textColor=colors.HexColor("#999999"), alignment=1
+    )
+
+    story = []
+
+    # Header
+    story.append(Paragraph("SCM AI Control Tower", title_style))
+    story.append(Paragraph(
+        f"Weekly Executive Report &nbsp;|&nbsp; Generated: {report.timestamp}",
+        subtitle_style
+    ))
+    story.append(HRFlowable(
+        width="100%", thickness=2,
+        color=colors.HexColor("#1a1a2e"), spaceAfter=12
+    ))
+
+    # KPI Table
+    story.append(Paragraph("Key Performance Indicators", section_style))
+    story.append(HRFlowable(
+        width="100%", thickness=0.5,
+        color=colors.HexColor("#cccccc"), spaceAfter=8
+    ))
+
+    kpi_data = [
+        ["Metric", "Value", "Status"],
+        ["Inventory Health",
+         f"{report.kpis.inventory_health}%",
+         "OK" if report.kpis.inventory_health >= 90 else "Below Target"],
+        ["Shipment On-Time Rate",
+         f"{report.kpis.shipment_on_time_rate}%",
+         "OK" if report.kpis.shipment_on_time_rate >= 85 else "Below Target"],
+        ["Supplier Health Score",
+         f"{report.kpis.supplier_health_score}%",
+         "OK" if report.kpis.supplier_health_score >= 75 else "Below Target"],
+        ["Critical Alerts",
+         str(report.kpis.critical_alerts_count),
+         "None" if report.kpis.critical_alerts_count == 0 else "Action Needed"],
+        ["Items Below Reorder",
+         str(report.kpis.items_below_reorder),
+         "None" if report.kpis.items_below_reorder == 0 else "Reorder Required"],
+        ["Projected Stockouts (14d)",
+         str(report.kpis.projected_stockouts_14d),
+         "None" if report.kpis.projected_stockouts_14d == 0 else "Urgent"],
+    ]
+
+    kpi_table = Table(kpi_data, colWidths=[3 * inch, 1.5 * inch, 2.5 * inch])
+    kpi_table.setStyle(TableStyle([
+        ("BACKGROUND",     (0, 0), (-1, 0),  colors.HexColor("#1a1a2e")),
+        ("TEXTCOLOR",      (0, 0), (-1, 0),  colors.white),
+        ("FONTNAME",       (0, 0), (-1, 0),  "Helvetica-Bold"),
+        ("FONTSIZE",       (0, 0), (-1, 0),  11),
+        ("ALIGN",          (0, 0), (-1, -1), "LEFT"),
+        ("ALIGN",          (1, 0), (1, -1),  "CENTER"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+         [colors.HexColor("#f8f9fa"), colors.white]),
+        ("FONTNAME",       (0, 1), (-1, -1), "Helvetica"),
+        ("FONTSIZE",       (0, 1), (-1, -1), 10),
+        ("GRID",           (0, 0), (-1, -1), 0.5, colors.HexColor("#dddddd")),
+        ("TOPPADDING",     (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING",  (0, 0), (-1, -1), 8),
+        ("LEFTPADDING",    (0, 0), (-1, -1), 10),
+    ]))
+    story.append(kpi_table)
+    story.append(Spacer(1, 12))
+
+    # Executive Summary
+    story.append(Paragraph("Executive Summary", section_style))
+    story.append(HRFlowable(
+        width="100%", thickness=0.5,
+        color=colors.HexColor("#cccccc"), spaceAfter=8
+    ))
+    story.append(Paragraph(report.executive_summary, body_style))
+
+    # Recommendations
+    story.append(Paragraph("Recommendations", section_style))
+    story.append(HRFlowable(
+        width="100%", thickness=0.5,
+        color=colors.HexColor("#cccccc"), spaceAfter=8
+    ))
+    for i, rec in enumerate(report.recommendations, 1):
+        story.append(Paragraph(f"{i}. {rec}", bullet_style))
+    story.append(Spacer(1, 8))
+
+    # Root Causes
+    story.append(Paragraph("Root Cause Analysis", section_style))
+    story.append(HRFlowable(
+        width="100%", thickness=0.5,
+        color=colors.HexColor("#cccccc"), spaceAfter=8
+    ))
+    for cause in report.root_causes:
+        story.append(Paragraph(f"- {cause}", bullet_style))
+    story.append(Spacer(1, 8))
+
+    # 14-Day Stockout Risk
+    if report.forward_projections:
+        story.append(Paragraph("14-Day Stockout Risk", section_style))
+        story.append(HRFlowable(
+            width="100%", thickness=0.5,
+            color=colors.HexColor("#cccccc"), spaceAfter=8
+        ))
+        proj_data = [["Product", "Status"]]
+        for p in report.forward_projections:
+            proj_data.append([p, "At Risk"])
+        proj_table = Table(proj_data, colWidths=[4.5 * inch, 2 * inch])
+        proj_table.setStyle(TableStyle([
+            ("BACKGROUND",     (0, 0), (-1, 0),  colors.HexColor("#e74c3c")),
+            ("TEXTCOLOR",      (0, 0), (-1, 0),  colors.white),
+            ("FONTNAME",       (0, 0), (-1, 0),  "Helvetica-Bold"),
+            ("FONTSIZE",       (0, 0), (-1, -1), 10),
+            ("ALIGN",          (0, 0), (-1, -1), "LEFT"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+             [colors.HexColor("#fff5f5"), colors.white]),
+            ("GRID",           (0, 0), (-1, -1), 0.5, colors.HexColor("#dddddd")),
+            ("TOPPADDING",     (0, 0), (-1, -1), 7),
+            ("BOTTOMPADDING",  (0, 0), (-1, -1), 7),
+            ("LEFTPADDING",    (0, 0), (-1, -1), 10),
+        ]))
+        story.append(proj_table)
+
+    # Footer
+    story.append(Spacer(1, 20))
+    story.append(HRFlowable(
+        width="100%", thickness=1,
+        color=colors.HexColor("#1a1a2e"), spaceBefore=8
+    ))
+    story.append(Paragraph(
+        f"Generated by SCM AI Control Tower &nbsp;|&nbsp; "
+        f"{report.timestamp} &nbsp;|&nbsp; Confidential",
+        footer_style
+    ))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.read()

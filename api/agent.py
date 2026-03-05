@@ -9,7 +9,9 @@ from models import Inventory, Supplier, Shipment
 
 from api.agents.supplier import SupplierAgent, SupplierProfile
 from api.agents.shipment import ShipmentAgent, ShipmentRecord
-from api.agents.report import ReportAgent
+from api.agents.report import ReportAgent, generate_report_pdf
+from fastapi.responses import StreamingResponse
+from io import BytesIO
 
 router = APIRouter()
 
@@ -458,3 +460,29 @@ async def agent_controller(req: AgentRequest):
 
     else:
         raise HTTPException(status_code=400, detail=f"Unknown action: {req.action}")
+    # ── PDF Download Endpoint ────────────────────────────────────
+# Frontend: <button onClick={() => window.open('http://localhost:8000/agent/report/pdf')}>
+#           Download Report PDF
+#           </button>
+
+@router.get("/report/pdf")
+async def download_report_pdf():
+    inventory = await fetch_inventory_from_db()
+    shipments = await fetch_shipments_from_db()
+    suppliers = await fetch_suppliers_from_db()
+
+    if not inventory:
+        raise HTTPException(
+            status_code=400,
+            detail="No inventory data found. Upload an inventory CSV first."
+        )
+
+    report    = await report_ai.create_weekly_report(inventory, shipments, suppliers)
+    pdf_bytes = generate_report_pdf(report)
+    filename  = f"scm_report_{report.timestamp.replace(' ', '_').replace(':', '-')}.pdf"
+
+    return StreamingResponse(
+        BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )

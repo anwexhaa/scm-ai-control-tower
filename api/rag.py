@@ -49,74 +49,53 @@ class QueryRequest(BaseModel):
 # ---------------- HELPER: Get Last Document ----------------
 
 def get_last_uploaded_document():
-    """
-    Retrieves metadata about the most recently uploaded document.
-    Returns the document source/filename.
-    """
     try:
         all_docs = collection.get(include=["metadatas"])
-        
         if not all_docs or not all_docs.get("metadatas"):
             return None
-        
         metadatas = all_docs["metadatas"]
-        
         latest_doc = None
         latest_timestamp = None
-        
         for meta in metadatas:
             timestamp = meta.get("upload_timestamp")
             if timestamp:
                 if latest_timestamp is None or timestamp > latest_timestamp:
                     latest_timestamp = timestamp
                     latest_doc = meta.get("source")
-        
         if not latest_doc and metadatas:
             latest_doc = metadatas[-1].get("source")
-        
         print(f"[DEBUG] Last uploaded document: {latest_doc}")
         return latest_doc
-        
     except Exception as e:
         print(f"[ERROR] Failed to get last document: {e}")
         return None
 
-# ---------------- INVENTORY → TEXT (now reads from DB) ----------------
+# ---------------- INVENTORY → TEXT ----------------
 
 async def inventory_to_text_chunks():
-    """
-    Reads active inventory from PostgreSQL and converts to
-    text chunks for RAG context. Replaces old CSV-based load_inventory().
-    """
     print("[DEBUG] Loading inventory data from DB...")
     chunks = []
-
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(Inventory).where(Inventory.is_active == True)
         )
         items = result.scalars().all()
         print(f"[DEBUG] Loaded {len(items)} inventory items from DB.")
-
         for item in items:
             status = (
                 "Low Stock"
                 if item.quantity_in_stock < item.reorder_threshold
                 else "Normal"
             )
-
             text = (
                 f"Product {item.product_id} ({item.product_name}) "
                 f"has {item.quantity_in_stock} units in stock. "
                 f"Reorder threshold is {item.reorder_threshold}. "
                 f"Inventory status is {status}."
             )
-
             if item.supplier_info:
                 text += f" Supplier information: {item.supplier_info}."
-
-        chunks.append(text)
-
+            chunks.append(text)  # ← fixed: inside the loop
     print(f"[DEBUG] Created {len(chunks)} inventory text chunks.")
     return chunks
 
@@ -133,21 +112,17 @@ def normalize_text(text: str) -> str:
 def evaluate_answer(generated: str, reference: str):
     generated_norm = normalize_text(generated)
     reference_norm = normalize_text(reference)
-
     scorer = rouge_scorer.RougeScorer(
-        ["rouge1", "rouge2", "rougeL"], 
+        ["rouge1", "rouge2", "rougeL"],
         use_stemmer=True
     )
-    
     rouge_scores = scorer.score(reference_norm, generated_norm)
-
     smoothie = SmoothingFunction().method4
     bleu = sentence_bleu(
         [reference_norm.split()],
         generated_norm.split(),
         smoothing_function=smoothie
     )
-
     return {
         "rouge1": round(rouge_scores["rouge1"].fmeasure * 100, 2),
         "rouge2": round(rouge_scores["rouge2"].fmeasure * 100, 2),
@@ -177,20 +152,16 @@ Respond ONLY in valid JSON format with no additional text:
   "faithfulness_score": a number between 0 and 1 (0 = completely unfaithful, 1 = completely faithful)
 }}
 """
-
     try:
         response = gemini_model.generate_content(prompt)
         result_text = response.text.strip()
-        
         if result_text.startswith("```json"):
             result_text = result_text[7:]
         if result_text.startswith("```"):
             result_text = result_text[3:]
         if result_text.endswith("```"):
             result_text = result_text[:-3]
-        
         result = json.loads(result_text.strip())
-        
         return {
             "faithful": result.get("faithful", False),
             "hallucinated_claims": result.get("hallucinated_claims", []),
@@ -211,10 +182,8 @@ def get_top_matching_chunks(query_emb, documents, doc_embeddings, top_n=3):
     for doc, emb in zip(documents, doc_embeddings):
         sim = dot(query_emb, emb) / (norm(query_emb) * norm(emb))
         similarities.append((sim, doc))
-    
     similarities.sort(reverse=True, key=lambda x: x[0])
     top_chunks = [doc for _, doc in similarities[:top_n]]
-    
     return " ".join(top_chunks)
 
 # ---------------- Inventory detection ----------------
@@ -239,7 +208,6 @@ async def rag_query(payload: QueryRequest):
 
         # 2. Chroma search with optional filtering
         query_top_k = max(payload.top_k, 10)
-        
         where_filter = None
         if payload.use_only_last_document:
             last_doc = get_last_uploaded_document()
@@ -248,7 +216,7 @@ async def rag_query(payload: QueryRequest):
                 print(f"[DEBUG] Filtering results to only: {last_doc}")
             else:
                 print("[WARNING] No last document found, using all documents")
-        
+
         results = collection.query(
             query_embeddings=[query_embedding],
             n_results=query_top_k,
@@ -259,10 +227,10 @@ async def rag_query(payload: QueryRequest):
         documents = results.get("documents", [[]])[0]
         metadatas = results.get("metadatas", [[]])[0]
 
-        # 3. Inventory augmentation from DB (skip if using only last doc)
+        # 3. Inventory augmentation from DB
         inventory_chunks = []
         if not payload.use_only_last_document:
-            inventory_chunks = await inventory_to_text_chunks()  # now async + DB
+            inventory_chunks = await inventory_to_text_chunks()
 
         if not documents and not inventory_chunks:
             return {
@@ -300,11 +268,10 @@ Answer:
 
         # 6. Evaluation
         doc_embeddings = [embedding_model.encode(doc) for doc in documents]
-
         if documents:
             reference_answer = get_top_matching_chunks(
-                embedding_model.encode(question), 
-                documents, 
+                embedding_model.encode(question),
+                documents,
                 doc_embeddings,
                 top_n=3
             )
