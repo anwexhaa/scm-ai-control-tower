@@ -3,16 +3,14 @@ import json
 import pandas as pd
 from io import StringIO
 from typing import Optional
-import google.generativeai as genai
+from google import genai
 from dotenv import load_dotenv
 
 load_dotenv()
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-model = genai.GenerativeModel("gemini-2.5-flash")
+_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
 # ─────────────────────────────────────────────
 # SCHEMA DEFINITIONS
-# What each file type expects after normalization
 # ─────────────────────────────────────────────
 
 SCHEMAS = {
@@ -32,14 +30,10 @@ SCHEMAS = {
 
 
 # ─────────────────────────────────────────────
-# STEP 1: Detect file type from headers + sample
+# STEP 1: Detect file type
 # ─────────────────────────────────────────────
 
 async def detect_file_type(headers: list[str], sample_rows: list[dict]) -> str:
-    """
-    Ask Gemini what kind of file this is based on headers and sample data.
-    Returns: "inventory" | "supplier" | "shipment"
-    """
     prompt = f"""
 You are a supply chain data expert. Given these CSV headers and sample rows, 
 identify what type of supply chain data this file contains.
@@ -54,11 +48,13 @@ Choose EXACTLY one of these types:
 
 Respond with ONLY the type word, nothing else. Example: inventory
 """
-    response = await model.generate_content_async(prompt)
+    response = await _client.aio.models.generate_content(
+        model="gemini-2.5-flash-lite",
+        contents=prompt
+    )
     file_type = response.text.strip().lower()
 
     if file_type not in ["inventory", "supplier", "shipment"]:
-        # Fallback: guess from headers
         header_str = " ".join(headers).lower()
         if any(w in header_str for w in ["stock", "quantity", "reorder", "product"]):
             return "inventory"
@@ -66,13 +62,13 @@ Respond with ONLY the type word, nothing else. Example: inventory
             return "supplier"
         elif any(w in header_str for w in ["shipment", "carrier", "tracking", "delivery_date"]):
             return "shipment"
-        return "inventory"  # last resort default
+        return "inventory"
 
     return file_type
 
 
 # ─────────────────────────────────────────────
-# STEP 2: Map raw columns to schema fields
+# STEP 2: Map columns
 # ─────────────────────────────────────────────
 
 async def map_columns_with_gemini(
@@ -80,11 +76,6 @@ async def map_columns_with_gemini(
     sample_rows: list[dict],
     file_type: str
 ) -> dict:
-    """
-    Uses Gemini to map the raw CSV headers to the target schema fields.
-    Returns a dict like: {"raw_column": "schema_field", ...}
-    Only maps columns that have a clear match — unmapped columns are ignored.
-    """
     schema = SCHEMAS[file_type]
     all_fields = schema["required"] + schema["optional"]
 
@@ -114,27 +105,26 @@ Expected output format:
 Example:
 {{"units_available": "quantity_in_stock", "sku_code": "product_id", "item_name": "product_name"}}
 """
-    response = await model.generate_content_async(prompt)
+    response = await _client.aio.models.generate_content(
+        model="gemini-2.5-flash-lite",
+        contents=prompt
+    )
     raw = response.text.strip()
-
-    # Strip markdown if Gemini adds backticks anyway
     raw = raw.replace("```json", "").replace("```", "").strip()
 
     try:
         mapping = json.loads(raw)
-        # Validate — only keep mappings to known schema fields
         valid_mapping = {
             k: v for k, v in mapping.items()
             if v in all_fields and k in headers
         }
         return valid_mapping
     except json.JSONDecodeError:
-        # Fallback: return empty mapping, let conflict detection catch missing required fields
         return {}
 
 
 # ─────────────────────────────────────────────
-# STEP 3: Apply mapping + normalize values
+# STEP 3: Apply mapping + normalize
 # ─────────────────────────────────────────────
 
 def apply_mapping_and_normalize(
@@ -142,24 +132,14 @@ def apply_mapping_and_normalize(
     mapping: dict,
     file_type: str
 ) -> tuple[list[dict], list[str]]:
-    """
-    Applies the column mapping to the dataframe and normalizes values.
-    Returns:
-        - normalized_rows: list of dicts with schema field names
-        - missing_required: list of required fields not found in mapping
-    """
     schema = SCHEMAS[file_type]
-
-    # Rename columns per mapping
     df_renamed = df.rename(columns=mapping)
 
-    # Check which required fields are present
     missing_required = [
         field for field in schema["required"]
         if field not in df_renamed.columns
     ]
 
-    # Build normalized rows — only include schema fields
     all_fields = schema["required"] + schema["optional"]
     available_fields = [f for f in all_fields if f in df_renamed.columns]
 
@@ -169,7 +149,6 @@ def apply_mapping_and_normalize(
         for field in available_fields:
             val = row[field]
 
-            # Normalize booleans
             if field == "is_on_time":
                 if str(val).lower() in ["1", "true", "yes"]:
                     val = True
@@ -178,7 +157,6 @@ def apply_mapping_and_normalize(
                 else:
                     val = None
 
-            # Normalize numeric fields
             elif field in ["quantity_in_stock", "reorder_threshold", "lead_time_days",
                            "historical_issues", "quantity"]:
                 try:
@@ -193,7 +171,6 @@ def apply_mapping_and_normalize(
                 except (ValueError, TypeError):
                     val = None
 
-            # Normalize strings
             elif isinstance(val, float) and pd.isna(val):
                 val = None
             else:
@@ -207,7 +184,7 @@ def apply_mapping_and_normalize(
 
 
 # ─────────────────────────────────────────────
-# STEP 4: Detect conflicts with existing DB data
+# STEP 4: Detect conflicts
 # ─────────────────────────────────────────────
 
 def detect_conflicts(
@@ -217,22 +194,12 @@ def detect_conflicts(
     existing_file_id: str,
     incoming_file_id: str
 ) -> list[dict]:
-    """
-    Compares incoming normalized rows against existing DB records.
-    Returns a list of conflict dicts for any fields that differ.
-
-    Name-matching is done on:
-      inventory → product_name
-      supplier  → supplier_name
-      shipment  → shipment_id
-    """
     name_key = {
         "inventory": "product_name",
         "supplier":  "supplier_name",
         "shipment":  "shipment_id"
     }[file_type]
 
-    # Fields to compare (skip IDs and timestamps)
     compare_fields = {
         "inventory": ["quantity_in_stock", "reorder_threshold", "unit_cost",
                       "avg_daily_consumption", "lead_time_days", "warehouse"],
@@ -241,7 +208,6 @@ def detect_conflicts(
         "shipment":  ["carrier", "expected_delivery", "quantity", "supplier", "carrier_avg_delay"]
     }[file_type]
 
-    # Index existing rows by name key
     existing_index = {
         row.get(name_key, "").lower(): row
         for row in existing_rows
@@ -256,7 +222,6 @@ def detect_conflicts(
             for field in compare_fields:
                 incoming_val = incoming.get(field)
                 existing_val = existing.get(field)
-                # Only flag if both have a value and they differ
                 if (incoming_val is not None and existing_val is not None
                         and str(incoming_val) != str(existing_val)):
                     conflicts.append({
@@ -274,7 +239,7 @@ def detect_conflicts(
 
 
 # ─────────────────────────────────────────────
-# MASTER FUNCTION: Full normalization pipeline
+# MASTER FUNCTION
 # ─────────────────────────────────────────────
 
 async def run_normalization_pipeline(
@@ -283,32 +248,15 @@ async def run_normalization_pipeline(
     existing_db_rows: list[dict],
     existing_file_id: Optional[str] = None
 ) -> dict:
-    """
-    Full pipeline:
-    1. Parse CSV
-    2. Detect file type
-    3. Map columns with Gemini
-    4. Apply mapping + normalize
-    5. Detect conflicts
-
-    Returns a preview dict ready to send to the frontend for confirmation.
-    """
-    # Parse CSV
     df = pd.read_csv(StringIO(csv_content))
-    df.columns = [c.strip() for c in df.columns]  # clean whitespace from headers
+    df.columns = [c.strip() for c in df.columns]
     headers = list(df.columns)
     sample_rows = df.head(3).to_dict(orient="records")
 
-    # Step 1: Detect file type
     file_type = await detect_file_type(headers, sample_rows)
-
-    # Step 2: Map columns
     mapping = await map_columns_with_gemini(headers, sample_rows, file_type)
-
-    # Step 3: Normalize
     normalized_rows, missing_required = apply_mapping_and_normalize(df, mapping, file_type)
 
-    # Step 4: Conflicts
     conflicts = []
     if existing_db_rows and existing_file_id:
         conflicts = detect_conflicts(
@@ -325,8 +273,8 @@ async def run_normalization_pipeline(
         "total_rows":       len(normalized_rows),
         "column_mapping":   mapping,
         "missing_required": missing_required,
-        "preview_rows":     normalized_rows[:5],  # first 5 for frontend display
-        "all_rows":         normalized_rows,       # full data kept in memory until commit
+        "preview_rows":     normalized_rows[:5],
+        "all_rows":         normalized_rows,
         "conflicts":        conflicts,
         "can_commit":       len(missing_required) == 0
     }

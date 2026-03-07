@@ -12,8 +12,7 @@ from sqlalchemy import select
 
 from database import AsyncSessionLocal
 from models import Inventory
-from sentence_transformers import SentenceTransformer
-import google.generativeai as genai
+from google import genai as google_genai
 
 from rouge_score import rouge_scorer
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
@@ -22,15 +21,7 @@ from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
 router = APIRouter()
 
-embedding_model = SentenceTransformer(
-    "sentence-transformers/all-MiniLM-L6-v2"
-)
-
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-
-gemini_model = genai.GenerativeModel(
-    model_name="gemini-2.5-flash"
-)
+_client = google_genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
 
@@ -45,6 +36,15 @@ class QueryRequest(BaseModel):
     question: str
     top_k: int = 5
     use_only_last_document: bool = False
+
+# ---------------- EMBEDDING HELPER ----------------
+
+def get_embedding(text: str) -> list[float]:
+    result = _client.models.embed_content(
+        model="gemini-embedding-001",
+        contents=text
+    )
+    return result.embeddings[0].values
 
 # ---------------- HELPER: Get Last Document ----------------
 
@@ -95,7 +95,7 @@ async def inventory_to_text_chunks():
             )
             if item.supplier_info:
                 text += f" Supplier information: {item.supplier_info}."
-            chunks.append(text)  # ← fixed: inside the loop
+            chunks.append(text)
     print(f"[DEBUG] Created {len(chunks)} inventory text chunks.")
     return chunks
 
@@ -153,7 +153,10 @@ Respond ONLY in valid JSON format with no additional text:
 }}
 """
     try:
-        response = gemini_model.generate_content(prompt)
+        response = _client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=prompt
+        )
         result_text = response.text.strip()
         if result_text.startswith("```json"):
             result_text = result_text[7:]
@@ -189,9 +192,12 @@ def get_top_matching_chunks(query_emb, documents, doc_embeddings, top_n=3):
 # ---------------- Inventory detection ----------------
 
 def is_inventory_question(question: str) -> bool:
-    keywords = ["inventory", "stock", "product", "reorder", "supplier", "quantity"]
+    inventory_keywords = ["inventory", "stock level", "reorder", "quantity in stock", "units in stock"]
+    policy_keywords = ["penalty", "sla", "policy", "procedure", "contract", "rate", "compliance", "standard"]
     question_lower = question.lower()
-    return any(kw in question_lower for kw in keywords)
+    if any(kw in question_lower for kw in policy_keywords):
+        return False
+    return any(kw in question_lower for kw in inventory_keywords)
 
 # ---------------- API ----------------
 
@@ -203,10 +209,8 @@ async def rag_query(payload: QueryRequest):
         if not question:
             raise HTTPException(status_code=400, detail="Question is empty")
 
-        # 1. Embed query
-        query_embedding = embedding_model.encode(question).tolist()
+        query_embedding = get_embedding(question)
 
-        # 2. Chroma search with optional filtering
         query_top_k = max(payload.top_k, 10)
         where_filter = None
         if payload.use_only_last_document:
@@ -227,7 +231,6 @@ async def rag_query(payload: QueryRequest):
         documents = results.get("documents", [[]])[0]
         metadatas = results.get("metadatas", [[]])[0]
 
-        # 3. Inventory augmentation from DB
         inventory_chunks = []
         if not payload.use_only_last_document:
             inventory_chunks = await inventory_to_text_chunks()
@@ -240,7 +243,6 @@ async def rag_query(payload: QueryRequest):
                 "filtered_to_last_document": payload.use_only_last_document
             }
 
-        # 4. Build context
         context_chunks = documents + inventory_chunks
         context = "\n\n".join(context_chunks)
 
@@ -262,15 +264,16 @@ Question:
 Answer:
 """
 
-        # 5. Generate answer
-        response = gemini_model.generate_content(prompt)
+        response = _client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=prompt
+        )
         answer = response.text.strip()
 
-        # 6. Evaluation
-        doc_embeddings = [embedding_model.encode(doc) for doc in documents]
+        doc_embeddings = [get_embedding(doc) for doc in documents]
         if documents:
             reference_answer = get_top_matching_chunks(
-                embedding_model.encode(question),
+                get_embedding(question),
                 documents,
                 doc_embeddings,
                 top_n=3
@@ -281,7 +284,6 @@ Answer:
         rouge_bleu_scores = evaluate_answer(answer, reference_answer)
         faithfulness = evaluate_faithfulness(answer, context)
 
-        # 7. Sources
         sources = [
             {
                 "text": doc,

@@ -7,12 +7,12 @@ import tempfile
 import os
 import uuid
 from typing import List
-
-from sentence_transformers import SentenceTransformer
+from datetime import datetime
+from google import genai as google_genai
 
 router = APIRouter()
 
-embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+_client = google_genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
 uploaded_files_metadata = []
 
@@ -22,6 +22,18 @@ collection = chroma_client.get_or_create_collection(
     name="pdf_chunks",
     metadata={"hnsw:space": "cosine"}
 )
+
+# ---------------- EMBEDDING HELPER ----------------
+
+def get_embedding(text: str) -> list[float]:
+    result = _client.models.embed_content(
+        model="gemini-embedding-001",
+        contents=text
+    )
+    return result.embeddings[0].values
+
+def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
+    return [get_embedding(text) for text in texts]
 
 @router.post("/pdf")
 async def upload_pdf(files: List[UploadFile] = File(...)):
@@ -71,7 +83,8 @@ async def upload_pdf(files: List[UploadFile] = File(...)):
             for _ in chunks:
                 all_metadatas.append({
                     "source": filename,
-                    "page": page_num + 1
+                    "page": page_num + 1,
+                    "upload_timestamp": datetime.now().isoformat()
                 })
 
         if not all_chunks:
@@ -80,14 +93,13 @@ async def upload_pdf(files: List[UploadFile] = File(...)):
 
         # 3. Generate embeddings
         try:
-            embeddings = embedding_model.encode(all_chunks, show_progress_bar=False).tolist()
+            embeddings = get_embeddings_batch(all_chunks)
             print(f"[DEBUG] Generated embeddings for {len(all_chunks)} chunks")
         except Exception as e:
             print(f"[ERROR] Embedding error for {filename}: {e}")
             raise HTTPException(status_code=500, detail=f"Embedding error: {e}")
 
         # 4. Store in persistent ChromaDB with unique IDs
-        # ── FIX: unique IDs per chunk so uploads never overwrite each other ──
         try:
             ids = [
                 f"chunk_{filename}_{i}_{uuid.uuid4().hex[:8]}"

@@ -1,7 +1,7 @@
 import os
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
-import google.generativeai as genai
+from google import genai
 from datetime import datetime
 from io import BytesIO
 
@@ -15,8 +15,7 @@ from reportlab.platypus import (
     TableStyle, HRFlowable
 )
 
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-model = genai.GenerativeModel("gemini-2.5-flash")
+_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
 
 # ── Pydantic Models ──────────────────────────────────────────
@@ -178,7 +177,10 @@ Products at Stockout Risk:
 Write a concise 3-4 sentence executive summary. Be direct about risks.
 Focus on what needs immediate attention and why. Do not use bullet points.
 """
-        response = await model.generate_content_async(prompt)
+        response = await _client.aio.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=prompt
+        )
         return response.text.strip()
 
     async def create_weekly_report(
@@ -190,7 +192,6 @@ Focus on what needs immediate attention and why. Do not use bullet points.
 
         suppliers = supplier_data or []
 
-        # Auto-correct missing fields
         for idx, item in enumerate(inventory_data):
             if not item.get("product_id"):
                 item["product_id"] = f"AUTO-{idx+1}"
@@ -274,8 +275,6 @@ Focus on what needs immediate attention and why. Do not use bullet points.
 
 
 # ── PDF Generator ─────────────────────────────────────────────
-# Called by GET /agent/report/pdf in agent.py
-# Returns raw bytes streamed directly to the browser as a download
 
 def generate_report_pdf(report: ExecutiveReport) -> bytes:
     buffer = BytesIO()
@@ -318,7 +317,6 @@ def generate_report_pdf(report: ExecutiveReport) -> bytes:
 
     story = []
 
-    # Header
     story.append(Paragraph("SCM AI Control Tower", title_style))
     story.append(Paragraph(
         f"Weekly Executive Report &nbsp;|&nbsp; Generated: {report.timestamp}",
@@ -329,7 +327,6 @@ def generate_report_pdf(report: ExecutiveReport) -> bytes:
         color=colors.HexColor("#1a1a2e"), spaceAfter=12
     ))
 
-    # KPI Table
     story.append(Paragraph("Key Performance Indicators", section_style))
     story.append(HRFlowable(
         width="100%", thickness=0.5,
@@ -378,7 +375,6 @@ def generate_report_pdf(report: ExecutiveReport) -> bytes:
     story.append(kpi_table)
     story.append(Spacer(1, 12))
 
-    # Executive Summary
     story.append(Paragraph("Executive Summary", section_style))
     story.append(HRFlowable(
         width="100%", thickness=0.5,
@@ -386,7 +382,6 @@ def generate_report_pdf(report: ExecutiveReport) -> bytes:
     ))
     story.append(Paragraph(report.executive_summary, body_style))
 
-    # Recommendations
     story.append(Paragraph("Recommendations", section_style))
     story.append(HRFlowable(
         width="100%", thickness=0.5,
@@ -396,7 +391,6 @@ def generate_report_pdf(report: ExecutiveReport) -> bytes:
         story.append(Paragraph(f"{i}. {rec}", bullet_style))
     story.append(Spacer(1, 8))
 
-    # Root Causes
     story.append(Paragraph("Root Cause Analysis", section_style))
     story.append(HRFlowable(
         width="100%", thickness=0.5,
@@ -406,7 +400,6 @@ def generate_report_pdf(report: ExecutiveReport) -> bytes:
         story.append(Paragraph(f"- {cause}", bullet_style))
     story.append(Spacer(1, 8))
 
-    # 14-Day Stockout Risk
     if report.forward_projections:
         story.append(Paragraph("14-Day Stockout Risk", section_style))
         story.append(HRFlowable(
@@ -432,7 +425,6 @@ def generate_report_pdf(report: ExecutiveReport) -> bytes:
         ]))
         story.append(proj_table)
 
-    # Footer
     story.append(Spacer(1, 20))
     story.append(HRFlowable(
         width="100%", thickness=1,

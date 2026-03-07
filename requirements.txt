@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+sqlalchemy[asyncio]
+asyncpg
+pydantic
+google-genai
+chromadb
+PyPDF2
+langchain-text-splitters
+reportlab
+rouge-score
+nltk
+numpy
+httpx
+python-multipart
+pandas
