@@ -1,10 +1,4 @@
-﻿// export function statusClass(status: string) {
-//   if (status === "Red") return "pill pill-danger";
-//   if (status === "Yellow") return "pill pill-warning";
-//   if (status === "Green") return "pill pill-success";
-//   return "pill";
-// }
-export function statusClass(status: string) {
+﻿export function statusClass(status: string) {
   if (status === "Red") return "pill pill-danger";
   if (status === "Yellow") return "pill pill-warning";
   if (status === "Green") return "pill pill-success";
