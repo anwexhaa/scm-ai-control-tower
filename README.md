@@ -1,5 +1,11 @@
 # 🏭✨ SCM AI Control Tower 🚀
-
+[![License: MIT](https://img.shields.io/badge/License-MIT-pink)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.11-pink?logo=python&logoColor=white)](https://python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-pink?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Next.js](https://img.shields.io/badge/Next.js-pink?logo=next.js&logoColor=white)](https://nextjs.org/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-pink?logo=postgresql&logoColor=white)](https://postgresql.org/)
+[![Gemini](https://img.shields.io/badge/Gemini_2.5_Flash-pink?logo=google&logoColor=white)](https://ai.google.dev/)
+[![Last Commit](https://img.shields.io/github/last-commit/anwexhaa/scm-ai-control-tower?color=pink)](https://github.com/anwexhaa/scm-ai-control-tower)
 > Agentic AI for supply chain intelligence — because your supply chain deserves better than a spreadsheet. 💀
 
 SCM AI Control Tower connects the dots your existing tools never could. Delayed shipment + low stock = stockout predicted automatically before it happens. Upload any CSV in any format. Ask your supplier contracts questions in plain English. Get a full executive report in 10 seconds. 🔥
