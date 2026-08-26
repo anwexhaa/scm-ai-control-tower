@@ -13,10 +13,16 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL not set in .env file")
 
+# Managed Postgres providers (Supabase, Neon, Render) require TLS on external
+# connections; a local dev Postgres on localhost typically doesn't have it enabled.
+_is_local_db = "localhost" in DATABASE_URL or "127.0.0.1" in DATABASE_URL
+_connect_args = {} if _is_local_db else {"ssl": "require"}
+
 engine = create_async_engine(
     DATABASE_URL,
-    echo=False,        # Set True to see raw SQL in terminal during dev
-    pool_pre_ping=True # Reconnects if connection drops
+    echo=False,          # Set True to see raw SQL in terminal during dev
+    pool_pre_ping=True,  # Reconnects if connection drops
+    connect_args=_connect_args
 )
 
 AsyncSessionLocal = async_sessionmaker(
