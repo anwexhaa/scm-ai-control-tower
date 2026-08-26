@@ -2,38 +2,17 @@ from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from PyPDF2 import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-import chromadb
+from sqlalchemy import select, func
 import tempfile
 import os
 import uuid
 from typing import List
-from datetime import datetime
-from google import genai as google_genai
+
+from database import AsyncSessionLocal
+from models import PdfChunk
+from api.embeddings import get_embeddings_batch
 
 router = APIRouter()
-
-_client = google_genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-
-uploaded_files_metadata = []
-
-# ── Use PersistentClient so chunks survive server restarts ──
-chroma_client = chromadb.PersistentClient(path="./chroma_db")
-collection = chroma_client.get_or_create_collection(
-    name="pdf_chunks",
-    metadata={"hnsw:space": "cosine"}
-)
-
-# ---------------- EMBEDDING HELPER ----------------
-
-def get_embedding(text: str) -> list[float]:
-    result = _client.models.embed_content(
-        model="gemini-embedding-001",
-        contents=text
-    )
-    return result.embeddings[0].values
-
-def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
-    return [get_embedding(text) for text in texts]
 
 @router.post("/pdf")
 async def upload_pdf(files: List[UploadFile] = File(...)):
@@ -83,8 +62,7 @@ async def upload_pdf(files: List[UploadFile] = File(...)):
             for _ in chunks:
                 all_metadatas.append({
                     "source": filename,
-                    "page": page_num + 1,
-                    "upload_timestamp": datetime.now().isoformat()
+                    "page": page_num + 1
                 })
 
         if not all_chunks:
@@ -99,30 +77,30 @@ async def upload_pdf(files: List[UploadFile] = File(...)):
             print(f"[ERROR] Embedding error for {filename}: {e}")
             raise HTTPException(status_code=500, detail=f"Embedding error: {e}")
 
-        # 4. Store in persistent ChromaDB with unique IDs
+        # 4. Store as vectors in Postgres (pgvector) — survives restarts/redeploys
         try:
             ids = [
                 f"chunk_{filename}_{i}_{uuid.uuid4().hex[:8]}"
                 for i in range(len(all_chunks))
             ]
-            collection.add(
-                documents=all_chunks,
-                embeddings=embeddings,
-                ids=ids,
-                metadatas=all_metadatas
-            )
+            async with AsyncSessionLocal() as db:
+                db.add_all([
+                    PdfChunk(
+                        id=chunk_id,
+                        source=meta["source"],
+                        page=meta["page"],
+                        chunk_text=chunk_text,
+                        embedding=embedding
+                    )
+                    for chunk_id, chunk_text, embedding, meta in zip(ids, all_chunks, embeddings, all_metadatas)
+                ])
+                await db.commit()
             print(f"[DEBUG] Stored {len(all_chunks)} chunks in vector DB for {filename}")
         except Exception as e:
             print(f"[ERROR] Vector insert error for {filename}: {e}")
             raise HTTPException(status_code=500, detail=f"Vector insert error: {e}")
 
         total_chunks_added += len(all_chunks)
-
-        uploaded_files_metadata.append({
-            "name": filename,
-            "status": "Indexed",
-            "size": f"{len(contents) // 1024} KB"
-        })
 
     print(f"[DEBUG] Total chunks added for all files: {total_chunks_added}")
     return JSONResponse({
@@ -133,4 +111,23 @@ async def upload_pdf(files: List[UploadFile] = File(...)):
 
 @router.get("/")
 async def list_uploaded_files():
-    return {"files": uploaded_files_metadata}
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(
+                PdfChunk.source,
+                func.count(PdfChunk.id).label("chunk_count"),
+                func.max(PdfChunk.upload_timestamp).label("uploaded_at")
+            ).group_by(PdfChunk.source)
+        )
+        rows = result.all()
+    return {
+        "files": [
+            {
+                "name": row.source,
+                "status": "Indexed",
+                "chunks": row.chunk_count,
+                "uploaded_at": row.uploaded_at.isoformat() if row.uploaded_at else None
+            }
+            for row in rows
+        ]
+    }

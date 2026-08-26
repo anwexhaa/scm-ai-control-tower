@@ -1,17 +1,16 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-import chromadb
 import os
 import traceback
 import re
 from numpy import dot
 from numpy.linalg import norm
 import json
-from datetime import datetime
-from sqlalchemy import select
+from sqlalchemy import select, desc
 
 from database import AsyncSessionLocal
-from models import Inventory
+from models import Inventory, PdfChunk
+from api.embeddings import get_embedding
 from google import genai as google_genai
 
 from rouge_score import rouge_scorer
@@ -23,13 +22,6 @@ router = APIRouter()
 
 _client = google_genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
-chroma_client = chromadb.PersistentClient(path="./chroma_db")
-
-collection = chroma_client.get_or_create_collection(
-    name="pdf_chunks",
-    metadata={"hnsw:space": "cosine"}
-)
-
 # ---------------- SCHEMA ----------------
 
 class QueryRequest(BaseModel):
@@ -37,33 +29,17 @@ class QueryRequest(BaseModel):
     top_k: int = 5
     use_only_last_document: bool = False
 
-# ---------------- EMBEDDING HELPER ----------------
-
-def get_embedding(text: str) -> list[float]:
-    result = _client.models.embed_content(
-        model="gemini-embedding-001",
-        contents=text
-    )
-    return result.embeddings[0].values
-
 # ---------------- HELPER: Get Last Document ----------------
 
-def get_last_uploaded_document():
+async def get_last_uploaded_document():
     try:
-        all_docs = collection.get(include=["metadatas"])
-        if not all_docs or not all_docs.get("metadatas"):
-            return None
-        metadatas = all_docs["metadatas"]
-        latest_doc = None
-        latest_timestamp = None
-        for meta in metadatas:
-            timestamp = meta.get("upload_timestamp")
-            if timestamp:
-                if latest_timestamp is None or timestamp > latest_timestamp:
-                    latest_timestamp = timestamp
-                    latest_doc = meta.get("source")
-        if not latest_doc and metadatas:
-            latest_doc = metadatas[-1].get("source")
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(PdfChunk.source)
+                .order_by(desc(PdfChunk.upload_timestamp))
+                .limit(1)
+            )
+            latest_doc = result.scalars().first()
         print(f"[DEBUG] Last uploaded document: {latest_doc}")
         return latest_doc
     except Exception as e:
@@ -212,24 +188,27 @@ async def rag_query(payload: QueryRequest):
         query_embedding = get_embedding(question)
 
         query_top_k = max(payload.top_k, 10)
-        where_filter = None
+        last_doc = None
         if payload.use_only_last_document:
-            last_doc = get_last_uploaded_document()
+            last_doc = await get_last_uploaded_document()
             if last_doc:
-                where_filter = {"source": last_doc}
                 print(f"[DEBUG] Filtering results to only: {last_doc}")
             else:
                 print("[WARNING] No last document found, using all documents")
 
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=query_top_k,
-            where=where_filter,
-            include=["documents", "metadatas"]
-        )
+        async with AsyncSessionLocal() as db:
+            stmt = (
+                select(PdfChunk.chunk_text, PdfChunk.source, PdfChunk.page)
+                .order_by(PdfChunk.embedding.cosine_distance(query_embedding))
+                .limit(query_top_k)
+            )
+            if last_doc:
+                stmt = stmt.where(PdfChunk.source == last_doc)
+            result = await db.execute(stmt)
+            rows = result.all()
 
-        documents = results.get("documents", [[]])[0]
-        metadatas = results.get("metadatas", [[]])[0]
+        documents = [row.chunk_text for row in rows]
+        metadatas = [{"source": row.source, "page": row.page} for row in rows]
 
         inventory_chunks = []
         if not payload.use_only_last_document:
@@ -308,7 +287,7 @@ Answer:
             "sources": sources if not is_inventory else [],
             "show_evaluation_and_sources": not is_inventory,
             "filtered_to_last_document": payload.use_only_last_document,
-            "document_used": get_last_uploaded_document() if payload.use_only_last_document else "all"
+            "document_used": last_doc if payload.use_only_last_document else "all"
         }
 
     except Exception as e:

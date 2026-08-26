@@ -5,7 +5,7 @@ sqlalchemy[asyncio]
 asyncpg
 pydantic
 google-genai
-chromadb
+pgvector
 PyPDF2
 langchain-text-splitters
 reportlab

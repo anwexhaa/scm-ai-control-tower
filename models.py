@@ -4,7 +4,9 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
+from pgvector.sqlalchemy import Vector
 from database import Base
+from api.embeddings import EMBEDDING_DIM
 
 
 # ─────────────────────────────────────────────
@@ -118,3 +120,17 @@ class Conflict(Base):
 
     file_a = relationship("UploadedFile", foreign_keys=[file_id_a], back_populates="conflicts_a")
     file_b = relationship("UploadedFile", foreign_keys=[file_id_b], back_populates="conflicts_b")
+
+
+# ─────────────────────────────────────────────
+# TABLE 6: RAG document chunks (pgvector store)
+# ─────────────────────────────────────────────
+class PdfChunk(Base):
+    __tablename__ = "pdf_chunks"
+
+    id                = Column(String, primary_key=True)   # uuid hex
+    source            = Column(String, nullable=False, index=True)   # original filename
+    page              = Column(Integer, nullable=True)
+    chunk_text        = Column(Text, nullable=False)
+    embedding         = Column(Vector(EMBEDDING_DIM), nullable=False)
+    upload_timestamp  = Column(DateTime(timezone=True), server_default=func.now())

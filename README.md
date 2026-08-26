@@ -109,9 +109,9 @@ npm run dev
 | Frontend | Next.js, TypeScript, Tailwind CSS |
 | Backend | FastAPI, Python 3.11 |
 | Database | PostgreSQL + SQLAlchemy async |
-| Vector Store | ChromaDB (persistent) |
+| Vector Store | pgvector (same Postgres instance) |
 | LLM | Gemini 2.5 Flash Lite |
-| Embeddings | Gemini text-embedding-004 |
+| Embeddings | Gemini gemini-embedding-001 (768-dim) |
 | PDF Generation | ReportLab |
 | Deployment | Render + Vercel |
 
@@ -126,4 +126,4 @@ npm run dev
 
 ---
 
-*Built with Python, FastAPI, Next.js, Gemini, PostgreSQL, and ChromaDB.* 🔥
+*Built with Python, FastAPI, Next.js, Gemini, PostgreSQL, and pgvector.* 🔥
